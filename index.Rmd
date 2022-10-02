@@ -1,0 +1,271 @@
+---
+title: "Limma differential expression analysis of top2b knockout mice vs wild type to assess doxorubicin-induced cardiotoxicity in cancer patients."
+author: "Layan Essam"
+date: "Last edited `r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document :
+    toc: true 
+    toc_depth : 3
+    number_sections : true
+    toc_float : true
+---
+This case study was carried out as a part of Datacamp's [Differential Expression Analysis with limma in R](https://app.datacamp.com/learn/courses/differential-expression-analysis-with-limma-in-r) course. 
+
+
+# Introduction 
+Cardiotoxicity is a side effect of Doxorubicin, a commonly-prescribed cancer drug. The purpose of this analysis is to test the hypothesis that Top2b deletion in cardiomyocytes prevents mice from developing doxorubicin-induced progressive heart failure. Therefore, suggesting that topoisomerase-II(Top2b) in cardiomyocytes mediates the cardiotoxicity caused by doxorubicin [Zhang et al.,2012.](https://pubmed.ncbi.nlm.nih.gov/23104132/)
+
+## Experimental design 
+Zhang and his colleagues performed a 2x2 factorial experiment. 
+
+
+- They used two types of mice:
+   - wild type mice
+   - Top2b null mice 
+- They treated the mice with
+   - doxorubicin
+   - PBS, a control solution. 
+   
+   
+The [data](https://assets.datacamp.com/production/repositories/1626/datasets/bb773b0ece1e325dc23933f8e492ef4d1a17cddd/dox.rds) contains measurements for 29,532 genes and 12 mice, with 3 replicates for each combination of the two factors.
+
+```{r packages , message=FALSE}
+library(limma)
+library(Biobase)
+```
+
+```{r , message=FALSE}
+#reading the data
+eset_raw <- readRDS("dox.rds")
+
+
+#view the number of features(row) and samples (columns) 
+dim(eset_raw)
+
+#view the number of replicates for each combination of the two factors
+table(pData(eset_raw)[,c("genotype","treatment")])
+```
+
+
+# Pre-processing
+
+## Inspect the features 
+
+Before starting the Limma pipeline we need to assess the current state of the data to see if any pre-processing steps are needed. One way to do that is to visualize the distribution of expression levels in all of the samples.  
+
+```{r} 
+plotDensities(eset_raw, group = pData(eset_raw)[, "genotype"],legend = "topright")
+``` 
+
+From the previous density plot it is clear that the data is very right-skewed and need further processing before testing our hypothesis. 
+
+## Log transformation 
+To get reliable results from a statistical test that assumes normality, we need to transform skewed data to approximate normal distribution. The log transformation is one way to archive that. Furthermore, it also helps meet the constant variance assumption in the linear modeling context. 
+
+```{r}
+## Create a new ExpressionSet to store the processed data
+eset <- eset_raw
+# Log transform
+exprs(eset) <- log(exprs(eset))
+# revisualize  
+plotDensities(eset,group = pData(eset)[,"genotype"], legend = "topright")
+```
+
+Now we can better visualize the entire distribution, yet those lowly expressed genes are still creating a right-skew. 
+In addition, note that the distributions are not the same across the samples.
+
+## Quantile normalize 
+Quantile normalization is a Multi-sample normalization technique used to remove technical variation from noisy data. These variations are typically due to technical artifacts inherent to all genomic techniques, not actual biological variability. 
+
+```{r}
+exprs(eset) <- normalizeBetweenArrays(exprs(eset))
+
+#revisualize
+plotDensities(eset,  group = pData(eset)[,"genotype"], legend = "topright")
+```
+
+Now every sample has the same empirical distribution.
+
+## Filter genes
+Although we have measured the majority of the genes in the genome, only a fraction of these genes are relevant to the system under investigation.
+So lastly, we need to remove lowly expressed genes to eliminate the right-skewness. To do that we need to choose a cutoff that excludes genes with low expression levels, in this case, genes with a mean expression value lower than 0. 
+
+```{r}
+# View the normalized gene expression levels
+plotDensities(eset, legend = FALSE); abline(v = 0)
+# Determine the genes with mean expression level greater than 0
+keep <- rowMeans(exprs(eset)) > 0
+sum(keep)
+# Filter the genes
+eset <- eset[keep,]
+plotDensities(eset, group = pData(eset)[,"genotype"], legend = "topright")
+``` 
+
+Now our dataset is analysis-ready!
+
+# Sanity check
+
+Now We'll run sanity checks after pre-processing the genes. 
+
+
+## Boxplot of Top2b
+
+The top2b knockout mice have had Top2b removed from their heart cells, so we need to confirm that they have lower Top2b expression levels before continuing the workflow. 
+
+```{r}
+#Find the row which contains Top2b expression data
+top2b <- which(fData(eset)[,"symbol"] == "Top2b")
+#Plot Top2b expression versus genotype
+boxplot(exprs(eset)[top2b, ] ~ pData(eset)[,"genotype"],
+        main = fData(eset)[top2b, ])
+```
+
+As expected, the expression of Top2b is much lower in the null mice (top2b) compared to wild type (wt).
+
+
+## Check sources of variation
+
+Lastly, we need to perform principal components analysis to check the sources of variation in the experiment. do the samples cluster by their treatment (PBS vs. Dox) and genotype(WT vs. Top2b null)?
+
+```{r}
+# Plot principal components labeled by genotype
+plotMDS(eset, labels = pData(eset)[,"genotype"], gene.selection = "common")
+
+#Plot principal components labeled by treatment
+plotMDS(eset, labels = pData(eset)[,"treatment"], gene.selection = "common")
+```
+
+The samples cluster by their genotype and treatment in 3 main groups. While wild type mice are separated by treatment, the Top2b null mice form one large cluster. This support our hypothesis that Top2b null mice are resistant to doxorubucin's cardiotoxic effects. 
+
+
+# Hypothesis testing
+Done with the exploratory analysis; it's time to formally test our hypothesis. To do that, we will perform differential expression analysis with limma.
+
+## Design matrix 
+We will start the differential expression analysis by creating a linear model with one coefficient for each of the 4 groups using group-means parametrization.
+
+keeping in mind that the experiment is a 2x2 factorial design, so we need to create a combined variable to build the design matrix. 
+
+```{r}
+# Create single variable
+group <- with(pData(eset), paste(genotype, treatment, sep = "."))
+group <- factor(group)
+
+# Create design matrix with no intercept
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+# Count the number of samples modeled by each coefficient
+colSums(design)
+```
+
+This resulted in four coefficients, each of which models three samples.
+
+## Contrasts matrix
+
+To test for doxorubicin effect on the heart cells of Top2b null mice and the wild type (as well as any interaction between treatment and genotype), we need to contrast the coefficients from the design matrix. 
+
+```{r}
+# Create a contrasts matrix
+cm <- makeContrasts(dox_wt = wt.dox - wt.pbs,
+                    dox_top2b = top2b.dox - top2b.pbs,
+                    interaction = (top2b.dox - top2b.pbs) - (wt.dox - wt.pbs),
+                    levels = design)
+
+# View the contrasts matrix
+cm
+```
+
+Now we're ready to test!
+
+## Test for differential expression
+
+Finally, we'll perform the hypothesis testing using the limma pipeline. After summarizing the results we will also create a Venn Diagram to reveal how many of the differentially expressed genes are shared between the 3 contrasts.
+
+```{r}
+# Fit the model
+fit <- lmFit(eset, design)
+
+# Fit the contrasts
+fit2 <- contrasts.fit(fit, contrasts = cm)
+
+# Calculate the t-statistics for the contrasts
+fit2 <- eBayes(fit2)
+
+# Summarize results
+results <- decideTests(fit2)
+summary(results)
+
+# Create a Venn diagram
+vennDiagram(results) 
+```
+
+As expected, the doxorubucin only had an effect on the wild type mice. This is in line with the initial theory that doxorubicin exerts its effect via Top2b. 
+
+
+
+# Inspecting the results
+Next, we need to further inspect the differential expression results. One way to do that is to visualize the results. 
+
+
+## Histogram of p-values 
+first, as a quality control metric we're going to inspect the p-values distributions for each contrast to confirm that the model was properly specified. 
+
+```{r}
+# Obtain the summary statistics for the contrast dox_wt
+stats_dox_wt <- topTable(fit2, coef = "dox_wt", number = nrow(fit2),sort.by = "none")
+# Obtain the summary statistics for the contrast dox_top2b
+stats_dox_top2b <- topTable(fit2, coef = "dox_top2b", number = nrow(fit2), sort.by = "none")
+# Obtain the summary statistics for the contrast interaction
+stats_interaction <- topTable(fit2, coef = "interaction", number = nrow(fit2), sort.by = "none")
+
+# Create histograms of the p-values for each contrast
+hist(stats_dox_wt[,"P.Value"])
+hist(stats_dox_top2b[,"P.Value"])
+hist(stats_interaction[,"P.Value"])
+```
+
+As expected, the null-samples show a uniform distribution of p-values, and a right skewed distribution for the wild type contrast.
+
+## Volcano plot
+Next, we will highlight the top genes and visualize the magnitude of the gene expression changes by plotting a volcano plot. it's also helpful to compare the ranges of the axes between the contrasts.
+
+```{r}
+# Extract the gene symbols
+gene_symbols <- fit2$genes[,"symbol"]
+
+# Create a volcano plot for the contrast dox_wt
+volcanoplot(fit2, coef = "dox_wt", highlight = 5, names = gene_symbols)
+
+# Create a volcano plot for the contrast dox_top2b
+volcanoplot(fit2, coef = "dox_top2b", highlight = 5, names = gene_symbols)
+
+# Create a volcano plot for the contrast interaction
+volcanoplot(fit2, coef = "interaction", highlight = 5, names = gene_symbols)
+```
+
+Note the difference in the ranges of the x and y-axis for the dox_top2b contrast compared to the other two.
+
+## Pathway enrichment
+
+Lastly, we will test for enrichment of differentially expressed genes in the KEGG pathway database to gain a systems-level perspective of our results. we will skip the Top2b null mice contrast Since it has zero differentially expressed genes. 
+
+```{r}
+# Extract the entrez gene IDs
+entrez <- fit2$genes[,"entrez"]
+
+# Test for enriched KEGG Pathways for contrast dox_wt
+enrich_dox_wt <- kegga(fit2, coef = "dox_wt", geneid = entrez, species = "Mm" )
+
+# View the top 5 enriched KEGG pathways
+topKEGG(enrich_dox_wt, number = 5)
+
+# Test for enriched KEGG Pathways for contrast interaction
+enrich_interaction <- kegga(fit2, coef = "interaction", geneid = entrez, species = "Mm")
+
+# View the top 5 enriched KEGG pathways
+topKEGG(enrich_interaction, number = 5)
+```
+
+
+
